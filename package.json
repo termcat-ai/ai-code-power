@@ -1,0 +1,53 @@
+{
+  "name": "ai-code-power",
+  "version": "0.1.0",
+  "description": "统一增强面板 — 自动识别 claude / codex 进程，注入会话历史、调用详情、Token 统计和原始请求/响应查看",
+  "main": "dist/extension.js",
+  "termcat": {
+    "displayName": {
+      "zh": "AI Code Power",
+      "en": "AI Code Power"
+    },
+    "description": {
+      "zh": "检测 claude/codex 进程并在右侧面板展示会话历史、工具调用、Token 统计和原始请求查看（支持代理捕获）",
+      "en": "Detects claude/codex processes and shows session history, tool calls, token stats and raw request viewer in the sidebar panel."
+    },
+    "entry": "dist/extension.js",
+    "activationEvents": [
+      "onStartup",
+      "onTerminalOpen"
+    ],
+    "permissions": [
+      "terminal.read",
+      "terminal.write",
+      "files.read",
+      "files.write"
+    ],
+    "contributes": {
+      "commands": [
+        {
+          "id": "ai-code-power.togglePanel",
+          "title": {
+            "zh": "打开/关闭 AI Code Power 面板",
+            "en": "Toggle AI Code Power Panel"
+          }
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "pack": "npm run build && cd dist && tar -czf ../ai-code-power.tgz ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "fzstd": "^0.1.1",
+    "pidtree": "^0.6.0",
+    "uuid": "^9.0.1"
+  }
+}

@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only build, do not publish a release'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+
+env:
+  # Opt into Node.js 24 for actions still bundled with Node 20 runtime
+  # (actions/checkout@v4, actions/setup-node@v4). Removes the deprecation warning.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          # On tag push: tag is source of truth — sync package.json to it so
+          # the published artifact carries the correct version even if the
+          # repo's package.json wasn't bumped before tagging.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            node -e "const fs=require('fs'),p='./package.json';const j=JSON.parse(fs.readFileSync(p));j.version='$VERSION';fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n');"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tgz=ai-code-power-${VERSION}.tgz" >> "$GITHUB_OUTPUT"
+          echo "Using version: $VERSION"
+
+      - name: Build
+        run: npm run build
+
+      - name: Prune to production dependencies
+        # esbuild marks all runtime deps (chokidar / fzstd / pidtree / uuid) as
+        # external, so the artifact must ship node_modules. Drop devDeps after
+        # the build so the bundle only carries what's needed at runtime.
+        run: npm prune --omit=dev
+
+      - name: Verify build output
+        shell: bash
+        run: |
+          test -f dist/extension.js || { echo "::error::dist/extension.js missing"; exit 1; }
+          # External runtime deps must be present in node_modules for the
+          # plugin to load inside TermCat.
+          for dep in chokidar fzstd pidtree uuid; do
+            test -d "node_modules/$dep" || { echo "::error::node_modules/$dep missing — prune removed a runtime dep"; exit 1; }
+          done
+          echo "dist/ size: $(du -sh dist | cut -f1)"
+          echo "node_modules/ size: $(du -sh node_modules | cut -f1)"
+          ls -la dist
+
+      - name: Package tgz
+        shell: bash
+        run: |
+          TGZ="${{ steps.resolve.outputs.tgz }}"
+          tar -czf "$TGZ" package.json dist node_modules README.md README_cn.md LICENSE
+          ls -lh "$TGZ"
+
+      - name: Upload build artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-code-power-${{ steps.resolve.outputs.version }}
+          path: ${{ steps.resolve.outputs.tgz }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          name: AI Code Power ${{ steps.resolve.outputs.version }}
+          files: ${{ steps.resolve.outputs.tgz }}
+          body: |
+            ## AI Code Power ${{ steps.resolve.outputs.version }}
+
+            统一的 Claude + Codex 巡检面板 TermCat 插件。
+
+            ### 安装
+
+            1. 下载 `${{ steps.resolve.outputs.tgz }}`
+            2. 解压到 TermCat 插件目录：
+               - macOS: `~/Library/Application Support/termcat/plugins/ai-code-power/`
+               - Linux: `~/.config/termcat/plugins/ai-code-power/`
+               - Windows: `%APPDATA%\termcat\plugins\ai-code-power\`
+            3. 在 TermCat 『设置 → 插件』启用
+            4. 完全退出 TermCat 再重启
+
+            ### 包内容
+            - `package.json` — 插件 manifest
+            - `dist/extension.js` — 主入口
+            - `node_modules/` — 运行时依赖（chokidar / fzstd / pidtree / uuid）
+            - `README.md` / `README_cn.md`
+            - `LICENSE`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
