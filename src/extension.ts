@@ -1110,6 +1110,9 @@ const BADGE_BY_STATUS: Record<string, { text: string; color: string }> = {
 };
 
 function pushPanel(sessionId: string): void {
+  // Only the active tab owns the shared panel. Background tabs' adapter.onUpdate
+  // and Detector ticks must NOT overwrite it, or the panel flickers between tabs.
+  if (sessionId !== store.getState().activeTabSessionId) return;
   const tab = store.getTab(sessionId);
   const adapter = tab?.adapter ?? null;
   const meta = adapter?.getMetadata() ?? null;
