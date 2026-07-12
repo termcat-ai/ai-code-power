@@ -17,6 +17,7 @@ import { ProxyServer } from './shared/proxy/proxy-server';
 import { CaptureStore } from './shared/proxy/capture-store';
 import { PtyInjector } from './shared/actions/pty-inject';
 import { turnsToMsgBlocks } from './shared/ui/msg-block-adapter';
+import { collectTurnFiles } from './shared/ui/file-ops';
 import { ClaudeSseStrategy } from './adapters/claude/sse-strategy';
 import { CodexSseStrategy } from './adapters/codex/sse-strategy';
 
@@ -907,6 +908,48 @@ function fmtTokens(n: number): string {
   return String(n);
 }
 
+function fileBaseName(p: string): string {
+  const parts = p.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p;
+}
+
+function fileDirName(p: string): string {
+  const idx = p.lastIndexOf('/');
+  return idx > 0 ? p.slice(0, idx) : '';
+}
+
+// Per-turn "文件读写" detail: distinct read files and written files rendered as
+// two separate groups, each a text heading (with count) + a nested file list.
+function buildFileGroupSections(turnIndex: number, reads: string[], writes: string[]): SectionDescriptor[] {
+  const out: SectionDescriptor[] = [];
+  const group = (key: string, label: string, files: string[], icon: string, color: string): void => {
+    if (!files.length) return;
+    out.push({
+      id: `turn-${turnIndex}-files-${key}-title`,
+      template: 'text',
+      data: { content: `${label} · ${files.length}`, format: 'plain', color, size: 'xs' },
+    });
+    out.push({
+      id: `turn-${turnIndex}-files-${key}`,
+      template: 'list',
+      variant: 'nested',
+      data: {
+        items: files.map((f, i) => ({
+          id: `${turnIndex}-file-${key}-${i}`,
+          label: fileBaseName(f),
+          description: fileDirName(f),
+          icon,
+          color,
+          tooltip: f,
+        })),
+      },
+    });
+  };
+  group('read', '读', reads, 'file-text', 'info');
+  group('write', '写', writes, 'file-pen', 'success');
+  return out;
+}
+
 function buildHistorySections(turns: UnifiedPromptTurn[], expandedTurns: Set<number>): SectionDescriptor[] {
   if (!turns.length) {
     return [{ id: 'history-empty', template: 'text', data: { content: '尚无历史 — 第一次输入 prompt 后会在这里出现', format: 'plain', color: 'muted' } }];
@@ -920,9 +963,12 @@ function buildHistorySections(turns: UnifiedPromptTurn[], expandedTurns: Set<num
     const preview = turn.userText.replace(/\n+/g, ' ').slice(0, 140);
     const toolCount = turn.apiCalls.reduce((acc, c) => acc + c.toolCalls.length, 0);
     const cacheTokens = turn.totalTokens.cacheReadTokens;
+    const { reads, writes } = collectTurnFiles(turn);
 
     const inlineBadges: Array<{ icon: string; text: string; color: string }> = [];
     if (toolCount > 0) inlineBadges.push({ icon: 'wrench', text: String(toolCount), color: 'muted' });
+    if (reads.length > 0) inlineBadges.push({ icon: 'file-text', text: String(reads.length), color: 'info' });
+    if (writes.length > 0) inlineBadges.push({ icon: 'file-pen', text: String(writes.length), color: 'success' });
     if (turn.totalTokens.freshInputTokens > 0) inlineBadges.push({ icon: 'arrow-up', text: fmtTokens(turn.totalTokens.freshInputTokens), color: 'muted' });
     if (turn.totalTokens.outputTokens > 0) inlineBadges.push({ icon: 'arrow-down', text: fmtTokens(turn.totalTokens.outputTokens), color: 'muted' });
     if (cacheTokens > 0) inlineBadges.push({ icon: 'database', text: fmtTokens(cacheTokens), color: 'info' });
@@ -947,6 +993,7 @@ function buildHistorySections(turns: UnifiedPromptTurn[], expandedTurns: Set<num
     });
 
     if (expanded) {
+      sections.push(...buildFileGroupSections(turn.index, reads, writes));
       for (const call of turn.apiCalls) {
         for (const tool of call.toolCalls) {
           const inputObj = (tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input))
