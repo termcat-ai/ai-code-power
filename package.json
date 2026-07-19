@@ -1,6 +1,6 @@
 {
   "name": "ai-code-power",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "统一增强面板 — 自动识别 claude / codex 进程，注入会话历史、调用详情、Token 统计和原始请求/响应查看",
   "main": "dist/extension.js",
   "termcat": {

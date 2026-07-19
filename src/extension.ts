@@ -10,14 +10,15 @@ import { ClaudeAdapter } from './adapters/claude';
 import { PresetStore, type Preset } from './adapters/claude/preset-store';
 import { CodexAdapter, buildCodexLaunch } from './adapters/codex';
 import { CodexPresetStore, type CodexPreset } from './adapters/codex/preset-store';
-import type { IAdapter, UnifiedPromptTurn } from './adapters/types';
+import type { IAdapter, UnifiedPromptTurn, UnifiedSkillInfo, UnifiedSubagentSummary } from './adapters/types';
+import { setLanguage, t } from './i18n';
 import { Detector } from './detector/process-watcher';
 import type { TerminalHandle } from './detector/process-watcher';
 import { ProxyServer } from './shared/proxy/proxy-server';
 import { CaptureStore } from './shared/proxy/capture-store';
 import { PtyInjector } from './shared/actions/pty-inject';
 import { turnsToMsgBlocks } from './shared/ui/msg-block-adapter';
-import { collectTurnFiles } from './shared/ui/file-ops';
+import { collectTurnFiles, collectFilesFromToolCalls } from './shared/ui/file-ops';
 import { ClaudeSseStrategy } from './adapters/claude/sse-strategy';
 import { CodexSseStrategy } from './adapters/codex/sse-strategy';
 
@@ -68,6 +69,11 @@ interface HostAPI {
     emit(name: string, data?: unknown): void;
     on(name: string, cb: (...args: unknown[]) => void): { dispose: () => void };
   };
+  // Optional — older hosts may not expose i18n; the plugin falls back to zh.
+  i18n?: {
+    getLanguage(): Promise<string>;
+    onDidChangeLanguage(cb: (lang: unknown) => void): { dispose: () => void };
+  };
 }
 
 type SectionDescriptor = {
@@ -116,6 +122,24 @@ const knownTerminals = new Map<string, HostTerminalInfo>();
 export async function activate(context: PluginContext): Promise<void> {
   if (!context.api) throw new Error('ai-code-power: host did not inject .api');
   api = context.api;
+
+  // Sync UI language with the host (same mechanism as claude_code_power):
+  // seed from getLanguage(), then follow onDidChangeLanguage.
+  try {
+    const initialLang = await api.i18n?.getLanguage();
+    if (typeof initialLang === 'string') setLanguage(initialLang);
+  } catch { /* keep zh default */ }
+  if (api.i18n) {
+    disposables.push(
+      api.i18n.onDidChangeLanguage((lang: unknown) => {
+        if (typeof lang === 'string') {
+          setLanguage(lang);
+          const activeId = store?.getState().activeTabSessionId;
+          if (activeId) pushPanel(activeId);
+        }
+      }),
+    );
+  }
 
   claudePresetStore = new PresetStore();
   await claudePresetStore.load().catch(() => {});
@@ -345,6 +369,16 @@ async function handleEvent(sectionId: string, eventId: string, payload: unknown)
       store.setGoto(activeId, `user-${turn.index}-${turn._internalId ?? turn.index}`);
       pushPanel(activeId);
     }
+    return;
+  }
+
+  // ── Sub-agent item click → detail modal (item id: "<turnIndex>-subagent-<i>") ──
+  if (eventId === 'list:select' && /^turn-\d+-subagents$/.test(sectionId)) {
+    const m = /^(\d+)-subagent-(\d+)$/.exec(String((p as { id?: string } | undefined)?.id ?? ''));
+    if (!m) return;
+    const turn = (adapter?.getPromptTurns() ?? []).find((tn) => tn.index === Number(m[1]));
+    const sa = turn?.subagents[Number(m[2])];
+    if (sa) await openSubagentModal(sa);
     return;
   }
 
@@ -945,14 +979,148 @@ function buildFileGroupSections(turnIndex: number, reads: string[], writes: stri
       },
     });
   };
-  group('read', '读', reads, 'file-text', 'info');
-  group('write', '写', writes, 'file-pen', 'success');
+  group('read', t().filesReadGroupTitle, reads, 'file-text', 'info');
+  group('write', t().filesWriteGroupTitle, writes, 'file-pen', 'success');
   return out;
+}
+
+// Per-turn "技能" detail: heading with count + nested list, one item per
+// distinct skill. Item shape mirrors claude_code_power's skill section
+// (name · title, description, /cmd|tool badge, full info in tooltip).
+function buildSkillGroupSections(turnIndex: number, skills: UnifiedSkillInfo[]): SectionDescriptor[] {
+  if (!skills.length) return [];
+  return [
+    {
+      id: `turn-${turnIndex}-skills-title`,
+      template: 'text',
+      data: { content: `${t().skillsGroupTitle} · ${skills.length}`, format: 'plain', color: 'primary', size: 'xs' },
+    },
+    {
+      id: `turn-${turnIndex}-skills`,
+      template: 'list',
+      variant: 'nested',
+      data: {
+        items: skills.map((info, i) => {
+          const tooltipLines = [info.name];
+          if (info.title) tooltipLines.push(info.title);
+          if (info.description) tooltipLines.push('', info.description);
+          if (info.baseDir) tooltipLines.push('', info.baseDir);
+          return {
+            id: `${turnIndex}-skill-${i}`,
+            label: info.title ? `${info.name} · ${info.title}` : info.name,
+            description: info.description || info.baseDir || '',
+            icon: 'sparkles',
+            color: 'primary',
+            badge: info.source === 'slash'
+              ? { text: '/cmd', color: 'info' }
+              : { text: 'tool', color: 'primary' },
+            tooltip: tooltipLines.join('\n'),
+          };
+        }),
+      },
+    },
+  ];
+}
+
+// Modal with one sub-agent's full call detail: overview / tools / files / skills.
+async function openSubagentModal(sa: UnifiedSubagentSummary): Promise<void> {
+  const shortHint = (input: unknown): string => {
+    const obj = (input && typeof input === 'object' && !Array.isArray(input)) ? input as Record<string, unknown> : null;
+    const hint = String(obj?.file_path ?? obj?.path ?? obj?.cmd ?? obj?.command ?? obj?.pattern ?? obj?.query ?? obj?.skill ?? obj?.prompt ?? '');
+    const oneLine = hint.replace(/\n+/g, ' ');
+    return oneLine.length > 100 ? oneLine.slice(0, 97) + '...' : oneLine;
+  };
+  const none = t().noneLabel;
+
+  const overview = [
+    `${sa.agentType ?? 'agent'}${sa.description ? ` — ${sa.description}` : ''}`,
+    `agent-${sa.agentId}`,
+    '',
+    `tools: ${sa.toolCalls.length}`,
+    `↑ ${fmtTokens(sa.tokenUsage.freshInputTokens)}   ↓ ${fmtTokens(sa.tokenUsage.outputTokens)}${sa.tokenUsage.cacheReadTokens > 0 ? `   cache ${fmtTokens(sa.tokenUsage.cacheReadTokens)}` : ''}`,
+  ].join('\n');
+
+  const tools = sa.toolCalls.length
+    ? sa.toolCalls.map((tc, i) => {
+        const hint = shortHint(tc.input);
+        return `${String(i + 1).padStart(3)}. ${tc.isError ? '✕ ' : ''}${tc.name}${hint ? ` — ${hint}` : ''}`;
+      }).join('\n')
+    : none;
+
+  const { reads, writes } = collectFilesFromToolCalls(sa.toolCalls);
+  const files = (reads.length || writes.length)
+    ? [
+        `${t().filesReadGroupTitle} · ${reads.length}`,
+        ...reads.map((f) => `  ${f}`),
+        '',
+        `${t().filesWriteGroupTitle} · ${writes.length}`,
+        ...writes.map((f) => `  ${f}`),
+      ].join('\n')
+    : none;
+
+  const skills = sa.skills.length
+    ? sa.skills.map((s) => {
+        const lines = [`· ${s.name}${s.title ? ` — ${s.title}` : ''} [${s.source === 'slash' ? '/cmd' : 'tool'}]`];
+        if (s.description) lines.push(`    ${s.description}`);
+        return lines.join('\n');
+      }).join('\n')
+    : none;
+
+  await api.ui.showMessage({
+    title: `${t().subagentsGroupTitle} — ${sa.agentType ?? sa.agentId}`,
+    tabs: [
+      { label: t().overviewTab, content: overview, format: 'pre' },
+      { label: `${t().toolsTab} · ${sa.toolCalls.length}`, content: tools, format: 'pre' },
+      { label: `${t().filesReadGroupTitle}/${t().filesWriteGroupTitle} · ${reads.length + writes.length}`, content: files, format: 'pre' },
+      { label: `${t().skillsGroupTitle} · ${sa.skills.length}`, content: skills, format: 'pre' },
+    ],
+  });
+}
+
+// Per-turn "子 Agent" detail: heading with count + nested list, one item per
+// spawned sub-agent (type · description, its tool count and token usage).
+function buildSubagentGroupSections(turnIndex: number, subagents: UnifiedSubagentSummary[]): SectionDescriptor[] {
+  if (!subagents.length) return [];
+  return [
+    {
+      id: `turn-${turnIndex}-subagents-title`,
+      template: 'text',
+      data: { content: `${t().subagentsGroupTitle} · ${subagents.length}`, format: 'plain', color: 'warning', size: 'xs' },
+    },
+    {
+      id: `turn-${turnIndex}-subagents`,
+      template: 'list',
+      variant: 'nested',
+      data: {
+        items: subagents.map((sa, i) => {
+          const label = sa.agentType ? `${sa.agentType}${sa.description ? ` · ${sa.description}` : ''}` : (sa.description || sa.agentId);
+          const stats = `${sa.toolCalls.length} tools · ↑${fmtTokens(sa.tokenUsage.freshInputTokens)} ↓${fmtTokens(sa.tokenUsage.outputTokens)}`;
+          const tooltipLines = [
+            `agent-${sa.agentId}${sa.agentType ? ` (${sa.agentType})` : ''}`,
+            ...(sa.description ? [sa.description] : []),
+            '',
+            stats + (sa.tokenUsage.cacheReadTokens > 0 ? ` · cache ${fmtTokens(sa.tokenUsage.cacheReadTokens)}` : ''),
+            '',
+            t().clickToViewSubagent,
+          ];
+          return {
+            id: `${turnIndex}-subagent-${i}`,
+            label,
+            description: stats,
+            icon: 'bot',
+            color: 'warning',
+            tooltip: tooltipLines.join('\n'),
+          };
+        }),
+        selectable: true,
+      },
+    },
+  ];
 }
 
 function buildHistorySections(turns: UnifiedPromptTurn[], expandedTurns: Set<number>): SectionDescriptor[] {
   if (!turns.length) {
-    return [{ id: 'history-empty', template: 'text', data: { content: '尚无历史 — 第一次输入 prompt 后会在这里出现', format: 'plain', color: 'muted' } }];
+    return [{ id: 'history-empty', template: 'text', data: { content: t().historyEmpty, format: 'plain', color: 'muted' } }];
   }
 
   const sections: SectionDescriptor[] = [];
@@ -961,17 +1129,30 @@ function buildHistorySections(turns: UnifiedPromptTurn[], expandedTurns: Set<num
   for (const turn of reversed) {
     const expanded = expandedTurns.has(turn.index);
     const preview = turn.userText.replace(/\n+/g, ' ').slice(0, 140);
-    const toolCount = turn.apiCalls.reduce((acc, c) => acc + c.toolCalls.length, 0);
+    const subagentToolCount = turn.subagents.reduce((acc, sa) => acc + sa.toolCalls.length, 0);
+    const toolCount = turn.apiCalls.reduce((acc, c) => acc + c.toolCalls.length, 0) + subagentToolCount;
     const cacheTokens = turn.totalTokens.cacheReadTokens;
     const { reads, writes } = collectTurnFiles(turn);
+    // Badge counts merge sub-agent internals; flag that in the tooltips.
+    const tip = (base: string): string => (turn.subagents.length ? `${base}\n${t().includesSubagentsNote}` : base);
 
-    const inlineBadges: Array<{ icon: string; text: string; color: string }> = [];
-    if (toolCount > 0) inlineBadges.push({ icon: 'wrench', text: String(toolCount), color: 'muted' });
-    if (reads.length > 0) inlineBadges.push({ icon: 'file-text', text: String(reads.length), color: 'info' });
-    if (writes.length > 0) inlineBadges.push({ icon: 'file-pen', text: String(writes.length), color: 'success' });
-    if (turn.totalTokens.freshInputTokens > 0) inlineBadges.push({ icon: 'arrow-up', text: fmtTokens(turn.totalTokens.freshInputTokens), color: 'muted' });
-    if (turn.totalTokens.outputTokens > 0) inlineBadges.push({ icon: 'arrow-down', text: fmtTokens(turn.totalTokens.outputTokens), color: 'muted' });
-    if (cacheTokens > 0) inlineBadges.push({ icon: 'database', text: fmtTokens(cacheTokens), color: 'info' });
+    const inlineBadges: Array<{ icon: string; text: string; color: string; tooltip?: string }> = [];
+    if (toolCount > 0) inlineBadges.push({ icon: 'wrench', text: String(toolCount), color: 'muted', tooltip: tip(t().toolCountTooltip) });
+    if (reads.length > 0) inlineBadges.push({ icon: 'file-text', text: String(reads.length), color: 'info', tooltip: tip(t().filesReadTooltip) });
+    if (writes.length > 0) inlineBadges.push({ icon: 'file-pen', text: String(writes.length), color: 'success', tooltip: tip(t().filesWriteTooltip) });
+    if (turn.skills.length > 0) inlineBadges.push({ icon: 'sparkles', text: String(turn.skills.length), color: 'primary', tooltip: tip(t().skillsTooltip) });
+    if (turn.totalTokens.freshInputTokens > 0) inlineBadges.push({
+      icon: 'arrow-up', text: fmtTokens(turn.totalTokens.freshInputTokens), color: 'muted',
+      tooltip: tip(t().tokenInTooltip),
+    });
+    if (turn.totalTokens.outputTokens > 0) inlineBadges.push({
+      icon: 'arrow-down', text: fmtTokens(turn.totalTokens.outputTokens), color: 'muted',
+      tooltip: tip(t().tokenOutTooltip),
+    });
+    if (cacheTokens > 0) inlineBadges.push({
+      icon: 'database', text: fmtTokens(cacheTokens), color: 'info',
+      tooltip: tip(t().tokenCacheTooltip),
+    });
 
     sections.push({
       id: `turn-${turn.index}`,
@@ -981,10 +1162,10 @@ function buildHistorySections(turns: UnifiedPromptTurn[], expandedTurns: Set<num
           id: String(turn.index),
           label: `#${turn.index}  ${preview || '(empty)'}`,
           inlineBadges,
-          leadingAction: { id: 'toggleExpand', icon: expanded ? 'chevron-down' : 'chevron-right', tooltip: expanded ? '收起' : '展开' },
+          leadingAction: { id: 'toggleExpand', icon: expanded ? 'chevron-down' : 'chevron-right', tooltip: expanded ? t().collapseTooltip : t().expandTooltip },
           actions: [
-            { id: 'viewRaw', icon: 'code', tooltip: '查看原始记录' },
-            { id: 'gotoTurn', icon: 'arrow-right', tooltip: '调用详情' },
+            { id: 'viewRaw', icon: 'code', tooltip: t().viewRawTooltip },
+            { id: 'gotoTurn', icon: 'arrow-right', tooltip: t().gotoTurnTooltip },
           ],
         }],
         selectable: false,
@@ -993,7 +1174,9 @@ function buildHistorySections(turns: UnifiedPromptTurn[], expandedTurns: Set<num
     });
 
     if (expanded) {
+      sections.push(...buildSkillGroupSections(turn.index, turn.skills));
       sections.push(...buildFileGroupSections(turn.index, reads, writes));
+      sections.push(...buildSubagentGroupSections(turn.index, turn.subagents));
       for (const call of turn.apiCalls) {
         for (const tool of call.toolCalls) {
           const inputObj = (tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input))

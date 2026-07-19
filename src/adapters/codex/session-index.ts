@@ -196,6 +196,8 @@ export class CodexSessionIndex {
           ts: rt.ts,
           apiCalls: rt.apiCalls,
           totalTokens,
+          skills: [], // Codex has no skill concept
+          subagents: [], // Codex has no sub-agent concept
           aborted: false,
           _internalId: `codex-${rt.turnId}`,
         };

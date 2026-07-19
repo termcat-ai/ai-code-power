@@ -4,6 +4,8 @@ import type { IAdapter, UnifiedPromptTurn, UnifiedSessionMeta, EnvConfig } from 
 import type { PtyInjector } from '../../shared/actions/pty-inject';
 import { ClaudeJsonlWatcher } from './jsonl-watcher';
 import { ClaudeSessionIndex } from './session-index';
+import { SubagentIndex } from './subagent-index';
+import { SubagentWatcher } from './subagent-watcher';
 import { SettingsReader } from './settings-reader';
 import { PresetStore, ACTIVE_ENV_PATH } from './preset-store';
 import { ClaudeSseStrategy } from './sse-strategy';
@@ -15,6 +17,9 @@ export class ClaudeAdapter implements IAdapter {
 
   private watcher: ClaudeJsonlWatcher | null = null;
   private index: ClaudeSessionIndex = new ClaudeSessionIndex();
+  private subagentIndex: SubagentIndex = new SubagentIndex();
+  private subagentWatcher: SubagentWatcher | null = null;
+  private subagentWatcherDisposable: { dispose: () => void } | null = null;
   private sessionFile: string | null = null;
   private cwd: string;
   private updateListeners: Array<() => void> = [];
@@ -45,6 +50,20 @@ export class ClaudeAdapter implements IAdapter {
       for (const cb of this.updateListeners) cb();
     });
     this.watcher.acquire();
+
+    // Sub-agent transcripts live in <session-uuid>/subagents/ next to the
+    // session JSONL. Attribution is lazy (setSubagentLookup) — any update just
+    // invalidates the turns cache and the next getPromptTurns re-attributes.
+    this.index.setSubagentLookup((toolUseId) => this.subagentIndex.byToolUseId(toolUseId));
+    const subagentsDir = path.join(dir, path.basename(sessionFile, '.jsonl'), 'subagents');
+    this.subagentWatcher = new SubagentWatcher(subagentsDir);
+    this.subagentWatcherDisposable = this.subagentWatcher.onUpdate((agentId, records, meta) => {
+      if (this.subagentIndex.addRecords(agentId, records, meta)) {
+        this.index.invalidateTurns();
+        for (const cb of this.updateListeners) cb();
+      }
+    });
+    this.subagentWatcher.start();
   }
 
   stopWatching(): void {
@@ -52,6 +71,11 @@ export class ClaudeAdapter implements IAdapter {
     this.watcherEventDisposable = null;
     this.watcher?.release();
     this.watcher = null;
+    this.subagentWatcherDisposable?.dispose();
+    this.subagentWatcherDisposable = null;
+    this.subagentWatcher?.stop();
+    this.subagentWatcher = null;
+    this.subagentIndex = new SubagentIndex();
     this.sessionFile = null;
     this.index = new ClaudeSessionIndex();
   }

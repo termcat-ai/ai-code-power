@@ -43,6 +43,42 @@ export interface ApiCallEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Unified skill invocation (Claude only — Codex has no skill concept)
+// ---------------------------------------------------------------------------
+export interface UnifiedSkillInfo {
+  /** Skill identifier — `namespace:slug` (Skill tool input) or folder name. */
+  name: string;
+  /** Absolute path to the skill's base directory (if known). */
+  baseDir?: string;
+  /** First heading from the skill's SKILL.md (if loaded via slash command). */
+  title?: string;
+  /** Short description (first non-empty body line after title, truncated). */
+  description?: string;
+  /** How the skill was invoked: 'tool' (Skill tool_use) or 'slash' (/xxx load). */
+  source: 'tool' | 'slash';
+}
+
+// ---------------------------------------------------------------------------
+// Unified sub-agent summary (Claude Task/Agent tool — Codex has none)
+// ---------------------------------------------------------------------------
+export interface UnifiedSubagentSummary {
+  /** From the transcript filename: subagents/agent-<agentId>.jsonl */
+  agentId: string;
+  /** meta.json toolUseId — matches the main-chain Task/Agent tool_use id. */
+  toolUseId: string;
+  /** meta.json agentType (e.g. 'Explore'). */
+  agentType?: string;
+  /** meta.json description. */
+  description?: string;
+  /** All tool calls made inside the sub-agent. */
+  toolCalls: UnifiedToolCall[];
+  /** Sum of the sub-agent's own API-call usage. */
+  tokenUsage: UnifiedTokenUsage;
+  /** Skills invoked inside the sub-agent. */
+  skills: UnifiedSkillInfo[];
+}
+
+// ---------------------------------------------------------------------------
 // Unified prompt turn
 // ---------------------------------------------------------------------------
 export interface UnifiedPromptTurn {
@@ -56,6 +92,13 @@ export interface UnifiedPromptTurn {
   apiCalls: ApiCallEntry[];
   /** Total token consumption across all API calls in this turn. */
   totalTokens: UnifiedTokenUsage;
+  /** Distinct skills invoked this turn, sub-agents included (empty for Codex). */
+  skills: UnifiedSkillInfo[];
+  /**
+   * Sub-agents spawned by this turn's Task/Agent calls (empty for Codex).
+   * Their tokens/skills are already merged into totalTokens/skills.
+   */
+  subagents: UnifiedSubagentSummary[];
   /** True if the user interrupted the turn before completion. */
   aborted: boolean;
   /** Adapter-internal: uuid/id used for raw-viewer cross-reference. */

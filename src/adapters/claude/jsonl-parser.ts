@@ -32,7 +32,9 @@ export interface ClaudeToolUse {
 function classifyTool(name: string): ClaudeToolKind {
   if (name === 'Skill') return 'skill';
   if (name.startsWith('mcp__')) return 'mcp';
-  if (name === 'Task') return 'task';
+  // 'Task' is the legacy sub-agent tool name; newer Claude Code calls it 'Agent'
+  // (exact match — TaskCreate/TaskUpdate etc. are task-list tools, not agents).
+  if (name === 'Task' || name === 'Agent') return 'task';
   return 'builtin';
 }
 
@@ -121,13 +123,16 @@ export type ClaudeEvent =
   | { kind: 'attachment'; uuid: string; parentUuid: string | null; ts: number; hookEvent: string; content: string }
   | { kind: 'chain-link'; uuid: string; parentUuid: string | null; ts: number };
 
-export function normalizeRecord(rec: RawRecord): ClaudeEvent | null {
+export function normalizeRecord(rec: RawRecord, opts?: { allowSidechain?: boolean }): ClaudeEvent | null {
   const uuid = asString(rec.uuid);
   if (!uuid) return null;
   const parentUuid = typeof rec.parentUuid === 'string' ? rec.parentUuid : null;
   const ts = asTimestamp(rec.timestamp);
   const topType = rec.type;
-  if (rec.isSidechain === true) return null;
+  // Sidechain records are sub-agent internals: dropped on the main chain, but
+  // the SubagentIndex parses dedicated subagents/*.jsonl files where every
+  // record is a sidechain — it opts in via allowSidechain.
+  if (rec.isSidechain === true && !opts?.allowSidechain) return null;
 
   if (topType === 'user') {
     if (rec.isMeta === true) {
